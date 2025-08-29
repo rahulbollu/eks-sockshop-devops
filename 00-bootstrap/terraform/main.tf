@@ -43,14 +43,7 @@ module "eks" {
   subnet_ids = module.vpc.private_subnets
 
   manage_aws_auth_configmap = true
-
-  aws_auth_roles = [
-    {
-      rolearn  = "arn:aws:iam::014030150269:role/EKS"
-      username = "admin"
-      groups   = ["system:masters"]
-    }
-  ]
+  enable_irsa               = true
 
   eks_managed_node_groups = {
     default = {
@@ -62,7 +55,15 @@ module "eks" {
     }
   }
 
-  enable_irsa = true
+  aws_auth_roles = [
+    {
+      rolearn  = "arn:aws:iam::014030150269:role/EKS"
+      username = "admin"
+      groups   = ["system:masters"]
+    }
+  ]
+ 
+  
   tags        = local.tags
 }
 
@@ -97,20 +98,56 @@ resource "helm_release" "argocd" {
   depends_on = [module.eks]
 }
 
+# ---------------------------
+# IAM Role for ALB Controller (IRSA)
+# ---------------------------
+module "alb_irsa" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "5.34.0"
+
+  role_name                              = "alb-controller-irsa"
+  attach_load_balancer_controller_policy = true
+
+  oidc_providers = {
+    main = {
+      provider_arn = module.eks.oidc_provider_arn
+    }
+  }
+}
+
 # ---------------------------------------------------
-# AWS Load Balancer Controller (ALB)
+# AWS Load Balancer Controller (ALB) via Helm
 # ---------------------------------------------------
-module "alb_controller" {
-  source  = "terraform-aws-modules/eks/aws//modules/aws-load-balancer-controller"
-  version = "21.1.5"
+resource "kubernetes_service_account" "alb" {
+  metadata {
+    name      = "aws-load-balancer-controller"
+    namespace = "kube-system"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = module.alb_irsa.iam_role_arn
+    }
+  }
+}
 
-  cluster_name           = module.eks.cluster_name
-  cluster_identity_oidc_issuer = module.eks.cluster_oidc_issuer_url
-  service_account_name   = "aws-load-balancer-controller"
-  vpc_id                 = module.vpc.vpc_id
+resource "helm_release" "alb_controller" {
+  name       = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  version    = "1.8.1"
 
-  create_service_account = true
-  enable_irsa            = true
+  values = [
+    yamlencode({
+      clusterName = module.eks.cluster_name
+      region      = var.region
+      serviceAccount = {
+        create = false
+        name   = "aws-load-balancer-controller"
+      }
+    })
+  ]
 
-  depends_on = [module.eks]
+  depends_on = [
+    kubernetes_service_account.alb,
+    module.eks
+  ]
 }
